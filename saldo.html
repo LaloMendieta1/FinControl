@@ -217,7 +217,15 @@
     .hist-row .col-gasto{display:none}
   }
   @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+
+  /* Respaldo Excel */
+  .backup-card{background:var(--surface);border-radius:var(--radius);padding:18px 20px;margin-top:16px;box-shadow:var(--shadow)}
+  .backup-card h2{font-family:"Fraunces";font-size:20px;font-weight:600;margin-bottom:4px}
+  .backup-actions{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+  .backup-actions .add-btn{flex:1;justify-content:center;min-width:150px;padding:12px 14px}
+  .backup-actions .add-btn.ghost{border:1.5px solid var(--teal-soft)}
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 </head>
 <body>
 <div class="wrap">
@@ -249,6 +257,16 @@
   <section class="block" id="debtPlanBlock"></section>
   <section class="goal-card" id="goalBlock"></section>
   <section class="hist-card" id="histBlock"></section>
+
+  <section class="backup-card">
+    <h2>Respaldo en Excel</h2>
+    <div class="block-desc" style="margin:0">Descarga todos tus datos en un Excel para guardarlos. Si algún día se borran, vuelve a cargarlos desde ese mismo archivo.</div>
+    <div class="backup-actions">
+      <button class="add-btn" onclick="exportExcel()">⬇️ Exportar a Excel</button>
+      <button class="add-btn ghost" onclick="document.getElementById('importFile').click()">⬆️ Importar de Excel</button>
+      <input type="file" id="importFile" accept=".xlsx,.xls" style="display:none">
+    </div>
+  </section>
 
   <footer>
     Saldo guarda tus datos en este dispositivo automáticamente. No es asesoría financiera profesional: es una herramienta de cálculo para ayudarte a organizarte.<br>
@@ -354,21 +372,41 @@ const PRESETS=[
 function recommend(c){
   if(c.income<=0) return null;
   const income=c.income;
+  const needsAmt=c.fixedTotal;                 // fijos reales (piso rígido)
+  const debtPay=c.debtTotal;                   // pago de deuda comprometido este mes
   const hasDebt=state.debts.some(d=>(+d.balance)>0);
   const highInt=state.debts.some(d=>(+d.balance)>0 && (+d.rate)>=15);
-  let targetA;
-  if(highInt) targetA=0.30; else if(hasDebt) targetA=0.25; else targetA=0.20;
-  if(c.left<0) targetA=Math.max(0.10,targetA-0.10);
-  const needsAmt=c.fixedTotal;
-  let saveAmt=targetA*income;
-  let wantsAmt=income-needsAmt-saveAmt;
-  const minWants=income*0.05;
-  if(wantsAmt<minWants){ wantsAmt=Math.max(0,minWants); saveAmt=Math.max(0,income-needsAmt-wantsAmt); }
-  const nP=Math.round(needsAmt/income*100), aP=Math.round(saveAmt/income*100);
-  let dP=100-nP-aP; if(dP<0)dP=0;
+
+  // DISPONIBLE real para gastos flexibles = ingreso menos fijos y pago de deuda comprometido
+  const disposable=Math.max(0, income-needsAmt-debtPay);
+
+  let mode, flexTarget, saveTarget;
+  if(hasDebt){
+    // Modo deuda: mantener flexibles bajos; todo lo demás acelera la salida de deudas
+    let flex = c.varTotal>0 ? c.varTotal : income*0.12;   // parte de lo que ya gastas
+    flex = Math.min(flex, income*0.20);                    // tope ~20% del ingreso
+    flex = Math.max(flex, income*0.08);                    // piso ~8% (comida/transporte)
+    flex = Math.min(flex, Math.max(0,income-needsAmt));    // no más de lo que queda tras fijos
+    flexTarget=flex;
+    saveTarget=Math.max(0, income-needsAmt-flexTarget);    // incluye pago de deuda + abono extra
+    mode=highInt?'debt-hot':'debt';
+  } else {
+    // Modo sano: reparto tipo 50/30/20 sobre fijos reales
+    saveTarget=income*0.20;
+    flexTarget=income-needsAmt-saveTarget;
+    if(flexTarget<income*0.05){ flexTarget=Math.max(0,income*0.05); saveTarget=Math.max(0,income-needsAmt-flexTarget); }
+    mode='healthy';
+  }
+
+  const nP=Math.round(needsAmt/income*100);
+  const dP=Math.round(flexTarget/income*100);
+  let aP=100-nP-dP; if(aP<0)aP=0;
   let best=PRESETS[0],bd=1e9;
   for(const p of PRESETS){const dist=Math.abs(p.n-nP)+Math.abs(p.d-dP)+Math.abs(p.a-aP);if(dist<bd){bd=dist;best=p;}}
-  return {needsAmt,wantsAmt,saveAmt,nP,dP,aP,preset:best,hasDebt,highInt,needsTooHigh:nP>70};
+
+  const extraToDebt=Math.max(0, saveTarget-debtPay);       // lo que puede abonar de más este mes
+  return {needsAmt,wantsAmt:flexTarget,saveAmt:saveTarget,disposable,debtPay,
+          nP,dP,aP,preset:best,hasDebt,highInt,mode,extraToDebt,needsTooHigh:nP>70};
 }
 
 /* ---------- Motor: plan de deudas ---------- */
@@ -472,64 +510,86 @@ function renderAdvice(){
   el.style.display='block';
   const r=recommend(c);
   let cls,title,body='',tips=[];
+
+  // Ruta de salida de deudas (si aplica): meses para liquidar metiendo el dinero libre
+  let routeLine='';
+  if(r.hasDebt){
+    const extra=Math.max(0,c.left);
+    const sim=simulate(extra, r.highInt?'avalanche':'snowball');
+    if(!sim.capped && sim.months>0){
+      routeLine=`<p style="font-size:12.5px;color:var(--ink-soft);margin-top:10px;background:var(--surface-2);padding:11px 13px;border-radius:11px">🛣️ <b>Tu ruta:</b> pagando ${money(c.debtTotal)}/mes${extra>0?` y metiendo tu libre de ${money(extra)}`:''}, quedas libre de deudas en <b>${monthsText(sim.months)}</b>. A partir de ahí, ese dinero pasa a ahorro y tu reparto sano será cercano al 50/30/20.</p>`;
+    }
+  }
+
   if(c.left<0){
     cls='bad';title='Estás gastando más de lo que ganas';
-    body=`Cada mes te faltan <b>${money(-c.left)}</b>. Antes de ahorrar, hay que cerrar esa brecha. Lo más rápido está en tus <b>gastos variables</b>.`;
+    body=`Cada mes te faltan <b>${money(-c.left)}</b>. Antes de cualquier plan, hay que cerrar esa brecha. Lo más rápido está en tus <b>gastos variables</b>.`;
     tips=[
       `Recorta al menos <b>${money(-c.left)}</b> al mes para quedar en cero. Empieza por lo no esencial: restaurantes, salidas, compras.`,
-      `Tu reparto realista → necesidades ${money(r.needsAmt)}, flexibles máx. ${money(r.wantsAmt)}, deuda/ahorro ${money(r.saveAmt)}.`,
+      `Para tu situación, mantén los flexibles en torno a <b>${money(r.wantsAmt)}</b> como máximo.`,
       r.hasDebt?`Si el pago de deudas te ahoga, llama a renegociar plazo para bajar la mensualidad mientras te estabilizas.`:`Evita tomar deuda nueva hasta equilibrar.`
+    ];
+  }else if(r.mode==='debt-hot'||r.mode==='debt'){
+    // MODO DEUDA: plan realista, no el ideal
+    cls=r.mode==='debt-hot'?'warn':'good';
+    title=r.mode==='debt-hot'?'Modo salir de deudas: a darle con todo':'Tienes deuda: enfócate en liquidarla';
+    body=`Hoy pagas <b>${money(r.debtPay)}</b>/mes de deuda. Mientras eso siga, tu reparto realista NO es el ideal: conviene mantener los flexibles bajos y mandar lo demás a la deuda. Después ahorras.`;
+    tips=[
+      `Mantén tus gastos flexibles en <b>${money(r.wantsAmt)}</b> o menos este mes (no en el 30-50% "ideal", eso es para cuando estés sin deudas).`,
+      r.extraToDebt>0
+        ? `Tienes <b>${money(r.extraToDebt)}</b> de margen sobre tu pago actual: abónalo a la deuda de mayor tasa (ve el Plan de salida abajo).`
+        : `Cada peso que recortes de flexibles, mándalo directo a la deuda de mayor tasa.`,
+      r.highInt?`Tu deuda es cara: cada abono extra te ahorra muchos intereses. Es tu mejor "inversión" hoy.`:`Conserva un colchón chico (${money(c.spent)}) y el resto a deuda.`
     ];
   }else if(c.rate<0.10){
     cls='warn';title='Vas justo: casi sin colchón';
     body=`Te queda <b>${money(c.left)}</b> libre (${(c.rate*100).toFixed(0)}% de tu ingreso). Un imprevisto te descuadra el mes.`;
     tips=[
-      `Meta sana: llegar a apartar ${money(r.saveAmt)} al mes (${r.aP}%).`,
+      `Meta sana: apartar ${money(r.saveAmt)} al mes (${r.aP}%).`,
       `Arma un fondo de emergencia de 3 a 6 meses de gastos: ${money(c.spent*3)} – ${money(c.spent*6)}.`,
-      `Baja tus flexibles a ${money(r.wantsAmt)}: ahí está el ajuste más fácil.`
+      `Mantén tus flexibles en torno a ${money(r.wantsAmt)}.`
     ];
   }else{
-    cls='good';title='Tienes margen: ahora hazlo trabajar';
+    cls='good';title='Sin deudas y con margen: ahora hazlo trabajar';
     body=`Te queda <b>${money(c.left)}</b> libre (${(c.rate*100).toFixed(0)}%). Es dinero que puede ir a un objetivo en vez de diluirse.`;
-    if(r.highInt) tips=[
-      `Tienes deuda cara: mete <b>${money(r.saveAmt)}</b> al mes a abonar de más, empezando por la de mayor tasa. Cada peso extra te ahorra intereses.`,
-      `Conserva un colchón mínimo de ${money(c.spent)} (un mes) mientras atacas la deuda.`,
-      `Al liquidarla, redirige ese mismo monto a ahorro sin cambiar tu estilo de vida.`];
-    else if(r.hasDebt) tips=[
-      `Reparte tu libre: ${money(r.saveAmt*0.6)} a adelantar deuda y ${money(r.saveAmt*0.4)} a tu fondo de emergencia.`,
-      `Apunta a un fondo de 3–6 meses: ${money(c.spent*3)} – ${money(c.spent*6)}.`,
-      `Automatiza el ahorro el día que cobras, antes de gastar.`];
-    else tips=[
+    tips=[
       `Aparta ${money(r.saveAmt)} al mes. Primero completa tu fondo de emergencia (3–6 meses: ${money(c.spent*3)} – ${money(c.spent*6)}).`,
       `Con el fondo listo, dirige ese ahorro a una meta concreta (fíjala abajo) o a inversión.`,
       `Automatiza: aparta el ahorro el mismo día de tu pago.`];
   }
+
+  // "ahora" se compara contra el objetivo realista recalculado
   const nNow=c.income>0?c.fixedTotal/c.income*100:0;
   const dNow=c.income>0?c.varTotal/c.income*100:0;
   const aNow=c.income>0?(c.left+c.debtTotal)/c.income*100:0;
+  const repartoLabel=(r.mode==='debt'||r.mode==='debt-hot')?'Tu plan de este mes':'Tu mejor reparto';
   el.className='advice '+cls;
   el.innerHTML=`
     <div class="coach">📊 Tu maestra de finanzas calculó</div>
     <h3>${title}</h3>
     <p>${body}</p>
     <ul>${tips.map(t=>`<li>${t}</li>`).join('')}</ul>
+    ${routeLine}
     <div class="rule-head">
       <span class="rule-tag">${r.nP}/${r.dP}/${r.aP}</span>
-      <span class="rule-name">Tu mejor reparto: ${r.preset.name}</span>
+      <span class="rule-name">${repartoLabel}: ${r.preset.name}</span>
     </div>
     <div class="rule">
-      ${ruleCell('Necesidades',r.needsAmt,nNow,r.nP,'var(--teal)')}
-      ${ruleCell('Flexibles',r.wantsAmt,dNow,r.dP,'var(--amber)')}
-      ${ruleCell('Ahorro + deuda',r.saveAmt,aNow,r.aP,'var(--green)')}
+      ${ruleCell('Necesidades',r.needsAmt,nNow,r.nP,'var(--teal)',false)}
+      ${ruleCell('Flexibles',r.wantsAmt,dNow,r.dP,'var(--amber)',false)}
+      ${ruleCell('Ahorro + deuda',r.saveAmt,aNow,r.aP,'var(--green)',true)}
     </div>
-    <p style="font-size:11.5px;color:var(--ink-faint);margin-top:12px">${r.needsTooHigh?'⚠️ Tus gastos fijos se comen más del 70% de tu ingreso. A mediano plazo, busca bajarlos (renta, suscripciones) o subir ingresos. ':''}Este reparto se recalcula solo cada vez que cambias tus números.</p>`;
+    <p style="font-size:11.5px;color:var(--ink-faint);margin-top:12px">${r.needsTooHigh?'⚠️ Tus gastos fijos se comen más del 70% de tu ingreso. A mediano plazo, busca bajarlos o subir ingresos. ':''}Este plan se recalcula solo cada vez que cambias tus números o tus gastos del mes.</p>`;
 }
-function ruleCell(label,targetAmt,nowPct,targetPct,color){
+function ruleCell(label,targetAmt,nowPct,targetPct,color,higherIsBetter){
   const w=Math.min(nowPct/Math.max(targetPct,1)*100,100);
+  // Para flexibles/necesidades, pasarse de la meta es malo (rojo). Para ahorro+deuda, pasarse es BUENO (verde).
   const over=nowPct>targetPct+2;
+  const bad = over && !higherIsBetter;
+  const barCol = bad ? 'var(--coral)' : (higherIsBetter && nowPct>=targetPct-2 ? 'var(--green)' : color);
   return `<div class="cell"><div class="lab">${label}</div><div class="target num">${money(targetAmt)}</div>
-    <div class="meter"><i style="width:${w}%;background:${over?'var(--coral)':color}"></i></div>
-    <div class="now ${over?'over':''}">ahora ${nowPct.toFixed(0)}% · meta ${targetPct}%</div></div>`;
+    <div class="meter"><i style="width:${w}%;background:${barCol}"></i></div>
+    <div class="now ${bad?'over':''}">ahora ${nowPct.toFixed(0)}% · meta ${targetPct}%</div></div>`;
 }
 
 function renderList(kind,blockId,title,desc){
@@ -554,16 +614,29 @@ function renderVariable(){
   const el=document.getElementById('variableBlock');
   let meter='';
   if(r){
-    const budget=r.wantsAmt, pct=budget>0?Math.min(total/budget*100,100):(total>0?100:0);
-    let col=total>budget?'var(--coral)':total>budget*0.85?'var(--amber)':'var(--green)';
-    let msg,mcol;
-    if(total>budget){msg=`Ya rebasaste tu presupuesto flexible por ${money(total-budget)}. Frena los gastos no esenciales.`;mcol='var(--coral)';}
-    else if(total>budget*0.85){msg=`Te queda poco: ${money(budget-total)} antes de tu límite flexible.`;mcol='var(--amber)';}
-    else{msg=`Vas bien. Aún tienes ${money(budget-total)} para gastos flexibles este mes.`;mcol='var(--green)';}
+    // DISPONIBLE real = lo que queda tras fijos y pago de deuda. Es lo que de verdad puedes gastar.
+    const disp=r.disposable;
+    const realLeft=c.left;                 // disponible - variables (puede ser negativo)
+    const pct=disp>0?Math.min(total/disp*100,100):(total>0?100:0);
+    let col,msg,mcol;
+    if(total>disp){
+      col=mcol='var(--coral)';
+      msg=`🚫 Te estás pasando de lo que puedes disponer. Gastaste ${money(total)} pero solo tenías ${money(disp)} disponible (tras fijos y deudas). Vas <b>${money(total-disp)}</b> en números rojos.`;
+    }else if(total>disp*0.85){
+      col=mcol='var(--amber)';
+      msg=`⚠️ Cuidado, casi te pasas: gastaste ${money(total)} de ${money(disp)} disponible. Te quedan solo <b>${money(realLeft)}</b> libres.`;
+    }else{
+      col=mcol='var(--green)';
+      msg=`Vas bien: gastaste ${money(total)} de ${money(disp)} que puedes disponer este mes. Te quedan <b>${money(realLeft)}</b> libres.`;
+    }
+    // Sugerencia de tope óptimo (para salir de deudas) si aplica
+    const tip = r.hasDebt && r.wantsAmt<disp
+      ? `<div style="font-size:11.5px;color:var(--ink-faint);margin-top:6px">💡 Para salir de deudas más rápido, intenta mantenerlos en ${money(r.wantsAmt)} y manda el resto a tu deuda.</div>`
+      : '';
     meter=`<div class="budget-meter">
-      <div class="bm-top"><span>Gastos flexibles del mes</span><span><b>${money(total)}</b> de ${money(budget)}</span></div>
+      <div class="bm-top"><span>Gastos flexibles del mes</span><span><b>${money(total)}</b> de ${money(disp)} disponible</span></div>
       <div class="bar"><i style="width:${pct}%;background:${col}"></i></div>
-      <div class="msg" style="color:${mcol}">${msg}</div></div>`;
+      <div class="msg" style="color:${mcol}">${msg}</div>${tip}</div>`;
   }
   let rows=items.map(it=>{const ci=catInfo('variable',it.cat);return `<div class="row">
     <div class="cat-dot">${ci.icon}</div>
@@ -845,11 +918,10 @@ function removeItem(kind,id,fromModal){try{state[kind]=state[kind].filter(x=>x.i
 
 function feedbackVariable(){
   const c=calc(),r=recommend(c);if(!r)return;
-  const total=c.varTotal,budget=r.wantsAmt;
-  if(c.left<0) toast(`¡Frena! Ya gastas más de lo que ganas este mes: te pasaste ${money(-c.left)}.`,'bad');
-  else if(total>budget) toast(`Ya te pasaste de tu presupuesto flexible por ${money(total-budget)}. Mejor no más gastos no esenciales.`,'bad');
-  else if(total>budget*0.85) toast(`Cuidado: te quedan solo ${money(budget-total)} de tu presupuesto flexible.`,'warn');
-  else toast(`Vas bien 👍 Aún tienes ${money(budget-total)} para gastos flexibles este mes.`,'good');
+  const total=c.varTotal, disp=r.disposable;
+  if(c.left<0) toast(`🚫 Te estás pasando de lo que puedes disponer: vas ${money(-c.left)} en rojo este mes.`,'bad');
+  else if(total>disp*0.85) toast(`⚠️ Cuidado, casi te pasas: te quedan solo ${money(c.left)} libres este mes.`,'warn');
+  else toast(`Vas bien 👍 Te quedan ${money(c.left)} libres de lo que puedes disponer este mes.`,'good');
 }
 function feedbackFixed(){
   const c=calc();
@@ -932,6 +1004,125 @@ document.getElementById('resetBtn').addEventListener('click',function(){
 function doReset(){
   try{state={income:0,freq:'month',fixed:[],variable:[],debts:[],goalName:'',goalTarget:0,goalSaved:0,history:[],monthKey:monthKeyNow()};}catch(e){}
   try{save();}catch(e){}try{closeModal();}catch(e){}try{render();}catch(e){}
+}
+
+/* ---------- Respaldo en Excel (SheetJS) ---------- */
+function freqText(f){return f==='biweek'?'Quincenal':'Mensual';}
+
+// Construye el libro de Excel a partir del estado. Devuelve un workbook de SheetJS.
+function buildWorkbook(st){
+  const wb=XLSX.utils.book_new();
+  const c0=calc(); // sobre el estado vivo
+  const resumen=[
+    ['Saldo — Respaldo de tus finanzas'],
+    ['Generado', new Date().toLocaleString('es-MX')],
+    ['Mes en curso', labelFromKey(st.monthKey)],
+    [],
+    ['Ingreso neto mensual', st.income||0],
+    ['Frecuencia de ingreso', freqText(st.freq)],
+    [],
+    ['Total gastos fijos', c0.fixedTotal],
+    ['Total gastos variables', c0.varTotal],
+    ['Pago de deudas al mes', c0.debtTotal],
+    ['Te queda libre', c0.left],
+  ];
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(resumen), 'Resumen');
+
+  const fijos=[['Nombre','Categoría','Monto']].concat((st.fixed||[]).map(x=>[x.name||'',x.cat||'',+x.amount||0]));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(fijos), 'Gastos fijos');
+
+  const vars=[['Nombre','Categoría','Monto']].concat((st.variable||[]).map(x=>[x.name||'',x.cat||'',+x.amount||0]));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(vars), 'Gastos variables');
+
+  const deudas=[['Nombre','Saldo','Pago mensual','Tasa anual %','Saldo inicial']].concat(
+    (st.debts||[]).map(d=>[d.name||'',+d.balance||0,+d.payment||0,+d.rate||0,+d.original||+d.balance||0]));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(deudas), 'Deudas');
+
+  const meta=[['Nombre','Objetivo','Ahorrado'],[st.goalName||'',+st.goalTarget||0,+st.goalSaved||0]];
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(meta), 'Meta');
+
+  const hist=[['Mes','Ingreso','Fijos','Variables','Deudas','Ahorro']].concat(
+    (st.history||[]).map(h=>[labelFromKey(h.key),+h.income||0,+h.fixed||0,+h.variable||0,+h.debt||0,+h.saved||0]));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(hist), 'Historial');
+
+  // Hoja técnica para restaurar EXACTO (no borrar)
+  const backup=[['No borres esta hoja: permite recargar tus datos en la app.'],['__SALDO__',JSON.stringify(st)]];
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(backup), '_Datos');
+  return wb;
+}
+
+function exportExcel(){
+  if(typeof XLSX==='undefined'){ toast('No se pudo cargar Excel (¿sin internet?). Inténtalo conectado.','bad'); return; }
+  try{
+    const wb=buildWorkbook(state);
+    const name='Saldo-respaldo-'+state.monthKey+'.xlsx';
+    XLSX.writeFile(wb, name);
+    toast('Excel descargado. Guárdalo en un lugar seguro.','good');
+  }catch(e){ toast('No se pudo exportar. Intenta de nuevo.','bad'); }
+}
+
+// Reconstruye un estado válido a partir de un workbook.
+function restoreFromWorkbook(wb){
+  // 1) Intentar respaldo EXACTO desde la hoja _Datos
+  try{
+    const ws=wb.Sheets['_Datos'];
+    if(ws){
+      const rows=XLSX.utils.sheet_to_json(ws,{header:1});
+      for(const row of rows){ if(row[0]==='__SALDO__'&&row[1]){ const obj=JSON.parse(row[1]); if(obj&&typeof obj==='object') return normalizeState(obj); } }
+    }
+  }catch(e){}
+  // 2) Reconstruir desde las hojas legibles
+  const st={income:0,freq:'month',fixed:[],variable:[],debts:[],goalName:'',goalTarget:0,goalSaved:0,history:[],monthKey:monthKeyNow()};
+  const rd=name=>{const ws=wb.Sheets[name];return ws?XLSX.utils.sheet_to_json(ws,{header:1}):[];};
+  // Resumen: ingreso y frecuencia
+  rd('Resumen').forEach(r=>{
+    if(r[0]==='Ingreso neto mensual') st.income=+r[1]||0;
+    if(r[0]==='Frecuencia de ingreso') st.freq=(String(r[1]).toLowerCase().indexOf('quincen')>-1)?'biweek':'month';
+  });
+  const parseItems=(name)=>rd(name).slice(1).filter(r=>r&&(r[0]||r[2])).map(r=>({id:uid(),name:String(r[0]||''),cat:String(r[1]||'otro'),amount:+r[2]||0}));
+  st.fixed=parseItems('Gastos fijos');
+  st.variable=parseItems('Gastos variables');
+  st.debts=rd('Deudas').slice(1).filter(r=>r&&(r[0]||r[1])).map(r=>({id:uid(),name:String(r[0]||''),balance:+r[1]||0,payment:+r[2]||0,rate:+r[3]||0,original:+r[4]||+r[1]||0}));
+  const m=rd('Meta')[1]; if(m){ st.goalName=String(m[0]||''); st.goalTarget=+m[1]||0; st.goalSaved=+m[2]||0; }
+  // Historial: convertir etiqueta de mes a key aprox (no crítico); guardamos lo numérico
+  return normalizeState(st);
+}
+function normalizeState(o){
+  const d={income:0,freq:'month',fixed:[],variable:[],debts:[],goalName:'',goalTarget:0,goalSaved:0,history:[],monthKey:monthKeyNow()};
+  const s=Object.assign(d,o||{});
+  if(!Array.isArray(s.fixed))s.fixed=[]; if(!Array.isArray(s.variable))s.variable=[];
+  if(!Array.isArray(s.debts))s.debts=[]; if(!Array.isArray(s.history))s.history=[];
+  if(!s.monthKey)s.monthKey=monthKeyNow();
+  return s;
+}
+
+document.getElementById('importFile').addEventListener('change',function(ev){
+  const file=ev.target.files&&ev.target.files[0];
+  ev.target.value=''; // permite re-importar el mismo archivo
+  if(!file)return;
+  if(typeof XLSX==='undefined'){ toast('No se pudo cargar Excel (¿sin internet?).','bad'); return; }
+  const reader=new FileReader();
+  reader.onload=function(e){
+    try{
+      const wb=XLSX.read(new Uint8Array(e.target.result),{type:'array'});
+      const restored=restoreFromWorkbook(wb);
+      // confirmar antes de sobrescribir
+      modal.innerHTML=`<h3>Importar respaldo</h3>
+        <p class="mintro">Se reemplazarán tus datos actuales por los del archivo:<br>
+        <b>${money(restored.income)}</b> de ingreso · ${restored.fixed.length} fijos · ${restored.variable.length} variables · ${restored.debts.length} deudas · ${restored.history.length} meses de historial.</p>
+        <div class="modal-acts"><button class="btn secondary" onclick="closeModal()">Cancelar</button>
+        <button class="btn primary" onclick="applyImport()">Reemplazar con el respaldo</button></div>`;
+      window.__pendingImport=restored;
+      overlay.classList.add('show');
+    }catch(err){ toast('No pude leer ese Excel. ¿Es un respaldo de Saldo?','bad'); }
+  };
+  reader.onerror=function(){ toast('No se pudo leer el archivo.','bad'); };
+  reader.readAsArrayBuffer(file);
+});
+function applyImport(){
+  try{ if(window.__pendingImport){ state=window.__pendingImport; window.__pendingImport=null; } }catch(e){}
+  try{save();}catch(e){}try{closeModal();}catch(e){}try{render();}catch(e){}
+  toast('Datos restaurados desde tu Excel.','good');
 }
 
 load();
